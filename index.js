@@ -16,12 +16,17 @@ const upload = multer({
     fileSize: 100 * 1024 * 1024 // 100MB limit
   },
  fileFilter: (req, file, cb) => {
-  if (file.mimetype.startsWith('video/')) {
+  console.log('Received file mimetype:', file.mimetype);
+  if (file.mimetype && file.mimetype.startsWith('video/')) {
+    cb(null, true);
+  } else if (file.originalname.match(/\.(mp4|webm|mkv)$/i)) {
+    // fallback based on file extension
     cb(null, true);
   } else {
     cb(new Error('Only video files are allowed! Received: ' + file.mimetype), false);
   }
 }
+
 
 });
 
