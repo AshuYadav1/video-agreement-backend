@@ -1,17 +1,25 @@
 const express = require('express');
 const multer = require('multer');
 const { google } = require('googleapis');
-const fs = require('fs');
+const fs = require('fs').promises;
 const path = require('path');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
-app.use(cors());
+
+// Configure CORS for production
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost', // Set FRONTEND_URL in .env
+  methods: ['POST', 'PATCH', 'GET'],
+  allowedHeaders: ['Content-Type'],
+}));
 app.use(express.json());
 
 // Create uploads directory if it doesn't exist
-if (!fs.existsSync('uploads')) {
-  fs.mkdirSync('uploads');
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir);
 }
 
 // Function to get correct MIME type based on file extension
@@ -25,36 +33,44 @@ function getCorrectMimeType(filename) {
     '.mov': 'video/quicktime',
     '.wmv': 'video/x-ms-wmv',
     '.flv': 'video/x-flv',
-    '.m4v': 'video/x-m4v'
+    '.m4v': 'video/x-m4v',
   };
-  return mimeTypes[ext] || 'video/mp4'; // Default to mp4 if unknown
+  if (!mimeTypes[ext]) {
+    throw new Error(`Unsupported video format: ${ext}`);
+  }
+  return mimeTypes[ext];
 }
 
-// Configure multer for video uploads
+// Configure Multer for video uploads
 const upload = multer({
-  dest: 'uploads/',
+  dest: uploadsDir,
   limits: {
-    fileSize: 100 * 1024 * 1024 // 100MB limit
+    fileSize: 100 * 1024 * 1024, // 100MB limit
   },
   fileFilter: (req, file, cb) => {
     console.log('Received file mimetype:', file.mimetype);
     console.log('File extension:', path.extname(file.originalname));
-    
-    // Check if it's a video by MIME type OR file extension
+
     const isVideoMime = file.mimetype && file.mimetype.startsWith('video/');
     const isVideoExt = file.originalname.match(/\.(mp4|webm|mkv|avi|mov|wmv|flv|m4v)$/i);
-    
+
     if (isVideoMime || isVideoExt) {
-      // Correct the MIME type if it's wrong
       if (!isVideoMime && isVideoExt) {
         file.mimetype = getCorrectMimeType(file.originalname);
         console.log('Corrected MIME type to:', file.mimetype);
       }
       cb(null, true);
     } else {
-      cb(new Error('Only video files are allowed! Received: ' + file.mimetype + ' for file: ' + file.originalname), false);
+      cb(new Error(`Only video files are allowed! Received: ${file.mimetype} for file: ${file.originalname}`), false);
     }
-  }
+  },
+});
+
+// Rate limiting for upload endpoint
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // Limit to 10 uploads per IP
+  message: 'Too many upload requests, please try again later.',
 });
 
 // Decode and write Google service account key from base64
@@ -64,7 +80,6 @@ if (!fs.existsSync(decodedKeyPath)) {
     console.error('Missing GOOGLE_KEY_BASE64 environment variable.');
     process.exit(1);
   }
-  
   fs.writeFileSync(
     decodedKeyPath,
     Buffer.from(process.env.GOOGLE_KEY_BASE64, 'base64').toString('utf8')
@@ -74,55 +89,58 @@ if (!fs.existsSync(decodedKeyPath)) {
 // Google Drive setup
 const auth = new google.auth.GoogleAuth({
   keyFile: decodedKeyPath,
-  scopes: ['https://www.googleapis.com/auth/drive.file']
+  scopes: ['https://www.googleapis.com/auth/drive.file'],
 });
 const drive = google.drive({ version: 'v3', auth });
 
-// Your shared Google Drive folder ID
-const FOLDER_ID = '1G0J0gopla4vDAMiaKzOaMPSQ3Y0nrk0U';
+const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '1G0J0gopla4vDAMiaKzOaMPSQ3Y0nrk0U';
+
+// Validate Google Drive folder at startup
+async function validateFolder() {
+  try {
+    await drive.files.get({ fileId: FOLDER_ID, fields: 'id' });
+    console.log(`Google Drive folder ${FOLDER_ID} is accessible.`);
+  } catch (error) {
+    console.error(`Error accessing Google Drive folder ${FOLDER_ID}:`, error.message);
+    process.exit(1);
+  }
+}
+validateFolder();
 
 // Upload endpoint
-app.post('/upload-video', upload.single('video'), async (req, res) => {
+app.post('/upload-video', uploadLimiter, upload.single('video'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No video file uploaded' });
     }
 
-    // Get person name from request body
-    const { personName } = req.body;
-    if (!personName || personName.trim() === '') {
-      return res.status(400).json({ error: 'Person name is required' });
-    }
-
     console.log('File received:', req.file.originalname);
-    console.log('Person name:', personName);
+    const originalFileName = req.file.originalname;
+
+    // Extract personName from filename (e.g., PartnershipDeclaration_John_Doe_2025-05-31_1234567890.webm)
+    const nameMatch = originalFileName.match(/^PartnershipDeclaration_(.+?)_\d{4}-\d{2}-\d{2}_\d+\.\w+$/);
+    const personName = nameMatch ? nameMatch[1] : 'Unknown';
+
+    console.log('Extracted person name:', personName);
     console.log('Final MIME type:', req.file.mimetype);
 
-    // Ensure we have the correct MIME type for Drive upload
-    const correctMimeType = req.file.mimetype.startsWith('video/') 
-      ? req.file.mimetype 
-      : getCorrectMimeType(req.file.originalname);
+    const correctMimeType = req.file.mimetype.startsWith('video/')
+      ? req.file.mimetype
+      : getCorrectMimeType(originalFileName);
 
-    // Create formatted filename: PersonName_YYYY-MM-DD_HH-MM-SS.extension
-    const now = new Date();
-    const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
-    const timeStr = now.toTimeString().split(' ')[0].replace(/:/g, '-'); // HH-MM-SS
-    const fileExtension = path.extname(req.file.originalname);
-    const sanitizedPersonName = personName.trim().replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '_');
-    const formattedFileName = `${sanitizedPersonName}_${dateStr}_${timeStr}${fileExtension}`;
+    // Use the original filename from the frontend
+    const formattedFileName = originalFileName;
 
     const fileMetadata = {
       name: formattedFileName,
-      parents: [FOLDER_ID]
+      parents: [FOLDER_ID],
+      mimeType: correctMimeType,
     };
 
     const media = {
       mimeType: correctMimeType,
-      body: fs.createReadStream(req.file.path)
+      body: fs.createReadStream(req.file.path),
     };
-
-    // Also set the MIME type in the file metadata to ensure Drive recognizes it correctly
-    fileMetadata.mimeType = correctMimeType;
 
     console.log('Uploading to Drive with filename:', formattedFileName);
     console.log('Uploading to Drive with MIME type:', correctMimeType);
@@ -130,60 +148,48 @@ app.post('/upload-video', upload.single('video'), async (req, res) => {
     const driveResponse = await drive.files.create({
       resource: fileMetadata,
       media,
-      fields: 'id,name,webViewLink,mimeType'
+      fields: 'id,name,webViewLink,mimeType',
     });
 
-    // Optional: make file public
+    // Make file public (optional, consider restricted access)
     await drive.permissions.create({
       fileId: driveResponse.data.id,
       requestBody: {
         role: 'reader',
-        type: 'anyone'
-      }
+        type: 'anyone',
+      },
     });
 
     // Clean up temporary file
-    fs.unlink(req.file.path, err => {
-      if (err) console.error('Error deleting temp file:', err);
-    });
+    await fs.unlink(req.file.path).catch(err => console.error('Error deleting temp file:', err));
 
     console.log('Video uploaded to Drive:', driveResponse.data);
 
     res.json({
       success: true,
-      message: 'Video uploaded successfully!',
-      fileId: driveResponse.data.id,
       fileName: driveResponse.data.name,
       driveLink: driveResponse.data.webViewLink,
-      mimeType: driveResponse.data.mimeType,
-      personName: sanitizedPersonName,
-      uploadDate: dateStr
     });
 
   } catch (error) {
     console.error('Upload error:', error);
-
     if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlink(req.file.path, err => {
-        if (err) console.error('Error deleting temp file on error:', err);
-      });
+      await fs.unlink(req.file.path).catch(err => console.error('Error deleting temp file on error:', err));
     }
-
     res.status(500).json({
       error: 'Failed to upload video',
-      details: error.message
+      details: process.env.NODE_ENV === 'production' ? 'Internal server error' : error.message,
     });
   }
 });
 
-// Alternative upload endpoint with person name in URL
-app.post('/upload-video/:personName', upload.single('video'), async (req, res) => {
+// Alternative upload endpoint with person name in URL (optional, can be removed if not used)
+app.post('/upload-video/:personName', uploadLimiter, upload.single('video'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No video file uploaded' });
     }
 
-    // Get person name from URL parameter
     const { personName } = req.params;
     if (!personName || personName.trim() === '') {
       return res.status(400).json({ error: 'Person name is required in URL' });
@@ -193,15 +199,13 @@ app.post('/upload-video/:personName', upload.single('video'), async (req, res) =
     console.log('Person name from URL:', personName);
     console.log('Final MIME type:', req.file.mimetype);
 
-    // Ensure we have the correct MIME type for Drive upload
-    const correctMimeType = req.file.mimetype.startsWith('video/') 
-      ? req.file.mimetype 
+    const correctMimeType = req.file.mimetype.startsWith('video/')
+      ? req.file.mimetype
       : getCorrectMimeType(req.file.originalname);
 
-    // Create formatted filename: PersonName_YYYY-MM-DD_HH-MM-SS.extension
     const now = new Date();
-    const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
-    const timeStr = now.toTimeString().split(' ')[0].replace(/:/g, '-'); // HH-MM-SS
+    const dateStr = now.toISOString().split('T')[0];
+    const timeStr = now.toTimeString().split(' ')[0].replace(/:/g, '-');
     const fileExtension = path.extname(req.file.originalname);
     const sanitizedPersonName = decodeURIComponent(personName).trim().replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '_');
     const formattedFileName = `${sanitizedPersonName}_${dateStr}_${timeStr}${fileExtension}`;
@@ -209,12 +213,12 @@ app.post('/upload-video/:personName', upload.single('video'), async (req, res) =
     const fileMetadata = {
       name: formattedFileName,
       parents: [FOLDER_ID],
-      mimeType: correctMimeType
+      mimeType: correctMimeType,
     };
 
     const media = {
       mimeType: correctMimeType,
-      body: fs.createReadStream(req.file.path)
+      body: fs.createReadStream(req.file.path),
     };
 
     console.log('Uploading to Drive with filename:', formattedFileName);
@@ -223,91 +227,74 @@ app.post('/upload-video/:personName', upload.single('video'), async (req, res) =
     const driveResponse = await drive.files.create({
       resource: fileMetadata,
       media,
-      fields: 'id,name,webViewLink,mimeType'
+      fields: 'id,name,webViewLink,mimeType',
     });
 
-    // Optional: make file public
     await drive.permissions.create({
       fileId: driveResponse.data.id,
       requestBody: {
         role: 'reader',
-        type: 'anyone'
-      }
+        type: 'anyone',
+      },
     });
 
-    // Clean up temporary file
-    fs.unlink(req.file.path, err => {
-      if (err) console.error('Error deleting temp file:', err);
-    });
+    await fs.unlink(req.file.path).catch(err => console.error('Error deleting temp file:', err));
 
     console.log('Video uploaded to Drive:', driveResponse.data);
 
     res.json({
       success: true,
-      message: 'Video uploaded successfully!',
-      fileId: driveResponse.data.id,
       fileName: driveResponse.data.name,
       driveLink: driveResponse.data.webViewLink,
-      mimeType: driveResponse.data.mimeType,
-      personName: sanitizedPersonName,
-      uploadDate: dateStr
     });
 
   } catch (error) {
     console.error('Upload error:', error);
-
     if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlink(req.file.path, err => {
-        if (err) console.error('Error deleting temp file on error:', err);
-      });
+      await fs.unlink(req.file.path).catch(err => console.error('Error deleting temp file on error:', err));
     }
-
     res.status(500).json({
       error: 'Failed to upload video',
-      details: error.message
+      details: process.env.NODE_ENV === 'production' ? 'Internal server error' : error.message,
     });
   }
 });
 
-// Fix existing file MIME type endpoint
+// MIME type fix endpoint
 app.patch('/fix-video-mime/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
-    const { fileName } = req.body; // Pass the original filename to determine correct MIME type
-    
+    const { fileName } = req.body;
+
     if (!fileName) {
       return res.status(400).json({ error: 'fileName is required in request body' });
     }
-    
+
     const correctMimeType = getCorrectMimeType(fileName);
-    
+
     console.log(`Fixing MIME type for file ${fileId} to ${correctMimeType}`);
-    
-    // Update the file's MIME type
+
     const updateResponse = await drive.files.update({
       fileId: fileId,
       resource: {
-        mimeType: correctMimeType
+        mimeType: correctMimeType,
       },
-      fields: 'id,name,mimeType,webViewLink'
+      fields: 'id,name,mimeType,webViewLink',
     });
-    
+
     console.log('MIME type updated:', updateResponse.data);
-    
+
     res.json({
       success: true,
-      message: 'MIME type updated successfully!',
-      fileId: updateResponse.data.id,
       fileName: updateResponse.data.name,
-      mimeType: updateResponse.data.mimeType,
-      driveLink: updateResponse.data.webViewLink
+      driveLink: updateResponse.data.webViewLink,
     });
-    
+
   } catch (error) {
     console.error('MIME type fix error:', error);
     res.status(500).json({
       error: 'Failed to fix MIME type',
-      details: error.message
+      details: process.env.NODE_ENV === 'production' ? 'Internal server error' : error.message,
     });
   }
 });
