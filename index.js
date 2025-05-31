@@ -32,7 +32,7 @@ const upload = multer({
 
 // Google Drive setup
 const auth = new google.auth.GoogleAuth({
- keyFile: 'D:/Documents/Video-agreement-Backend/evslotbookingapp-52cccd328d7b.json',
+  keyFile: path.join(__dirname, 'service-account-key.json'),
   scopes: ['https://www.googleapis.com/auth/drive.file']
 });
 
