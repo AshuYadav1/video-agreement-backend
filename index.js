@@ -273,17 +273,16 @@ app.post('/upload-video/:personName', upload.single('video'), async (req, res) =
 app.patch('/fix-video-mime/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
-    const { fileName } = req.body; // Pass the original filename to determine correct MIME type
-    
+    const { fileName } = req.body;
+
     if (!fileName) {
       return res.status(400).json({ error: 'fileName is required in request body' });
     }
-    
+
     const correctMimeType = getCorrectMimeType(fileName);
-    
+
     console.log(`Fixing MIME type for file ${fileId} to ${correctMimeType}`);
-    
-    // Update the file's MIME type
+
     const updateResponse = await drive.files.update({
       fileId: fileId,
       resource: {
@@ -291,9 +290,9 @@ app.patch('/fix-video-mime/:fileId', async (req, res) => {
       },
       fields: 'id,name,mimeType,webViewLink'
     });
-    
+
     console.log('MIME type updated:', updateResponse.data);
-    
+
     res.json({
       success: true,
       message: 'MIME type updated successfully!',
@@ -302,15 +301,17 @@ app.patch('/fix-video-mime/:fileId', async (req, res) => {
       mimeType: updateResponse.data.mimeType,
       driveLink: updateResponse.data.webViewLink
     });
-    
+
   } catch (error) {
-    console.error('MIME type fix error:', error);
+    console.error('Error updating MIME type:', error);
+
     res.status(500).json({
-      error: 'Failed to fix MIME type',
+      error: 'Failed to update MIME type',
       details: error.message
     });
   }
 });
+
 
 // Health check
 app.get('/health', (req, res) => {
