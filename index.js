@@ -79,7 +79,7 @@ const auth = new google.auth.GoogleAuth({
 const drive = google.drive({ version: 'v3', auth });
 
 // Your shared Google Drive folder ID
-const FOLDER_ID = '1G0J0gopla4vDAMiaKzOaMPSQ3Y0nrk0U';
+const FOLDER_ID = '1VuEY77a5T1AIN2594fTk7NEOlky_mOnp';
 
 // Upload endpoint
 app.post('/upload-video', upload.single('video'), async (req, res) => {
